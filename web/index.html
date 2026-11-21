@@ -1,0 +1,289 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Periferia IT | Registro de Proveedores</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f1f4f8;
+      color: #17243a;
+    }
+    header {
+      background: #102b50;
+      color: white;
+      padding: 20px 7%;
+    }
+    header h1 { margin: 0; font-size: 21px; }
+    header p { margin: 6px 0 0; color: #c5d6eb; font-size: 13px; }
+    main {
+      max-width: 1000px;
+      margin: 30px auto;
+      padding: 0 16px;
+    }
+    .panel {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 4px 18px #142c5010;
+      overflow: hidden;
+    }
+    .toolbar {
+      padding: 16px 20px;
+      border-bottom: 1px solid #e5eaf0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .status { color: #18834d; font-size: 13px; }
+    #chat {
+      height: 490px;
+      overflow-y: auto;
+      padding: 22px;
+    }
+    .message {
+      max-width: 85%;
+      padding: 13px 16px;
+      margin-bottom: 15px;
+      border-radius: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .assistant {
+      background: #edf3fa;
+      margin-right: auto;
+    }
+    .user {
+      background: #153c69;
+      color: white;
+      margin-left: auto;
+    }
+    .tool {
+      max-width: 95%;
+      margin: 12px auto;
+      padding: 13px;
+      border: 1px solid #d7e1ed;
+      border-left: 4px solid #3477b9;
+      border-radius: 8px;
+      background: #f8fafc;
+      font-size: 13px;
+    }
+    .tool strong { color: #174875; }
+    .tool pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    .thinking {
+      color: #65758a;
+      font-size: 13px;
+      padding: 10px 22px;
+    }
+    .composer {
+      display: flex;
+      gap: 10px;
+      padding: 16px;
+      border-top: 1px solid #e5eaf0;
+    }
+    textarea {
+      flex: 1;
+      resize: vertical;
+      min-height: 48px;
+      max-height: 130px;
+      padding: 13px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font: inherit;
+    }
+    button {
+      background: #1765a5;
+      color: white;
+      border: 0;
+      padding: 0 23px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:disabled { opacity: .5; cursor: wait; }
+    .welcome {
+      color: #53647a;
+      line-height: 1.7;
+    }
+    .confirmation {
+      background: #fff8e6;
+      border-left: 4px solid #d99b20;
+      padding: 12px;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+    footer {
+      text-align: center;
+      color: #718096;
+      font-size: 12px;
+      padding: 18px;
+    }
+    @media(max-width:600px) {
+      #chat { height: 65vh; }
+      .message { max-width: 95%; }
+      .composer { flex-direction: column; }
+      button { min-height: 45px; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Periferia IT Group</h1>
+  <p>Asistente inteligente de registro de proveedores</p>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="toolbar">
+      <strong>Asistente de proveedores</strong>
+      <span class="status" id="status">● Conectando</span>
+    </div>
+
+    <div id="chat" aria-live="polite">
+      <div class="welcome">
+        <strong>Bienvenido al registro de proveedores.</strong>
+        <p>Puedo ayudarte a revisar solicitudes, completar formularios y preparar paquetes documentales.</p>
+        <p>Indica el caso que deseas procesar:</p>
+        <ul>
+          <li>co-industrias-delta</li>
+          <li>ec-corp-andina</li>
+          <li>hn-agroexport-sula</li>
+          <li>pa-logistica-istmo</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="thinking" id="thinking" hidden>
+      El asistente está procesando tu solicitud...
+    </div>
+
+    <form class="composer" id="form">
+      <textarea id="message" placeholder="Escribe tu solicitud..." required></textarea>
+      <button id="send" type="submit">Enviar</button>
+    </form>
+  </section>
+</main>
+
+<footer>
+  Periferia IT Group · Automatización del registro de proveedores
+</footer>
+
+<script>
+  const chat = document.getElementById("chat");
+  const form = document.getElementById("form");
+  const input = document.getElementById("message");
+  const send = document.getElementById("send");
+  const thinking = document.getElementById("thinking");
+  const status = document.getElementById("status");
+
+  let sessionId = null;
+
+  function agregarMensaje(texto, clase) {
+    const div = document.createElement("div");
+    div.className = "message " + clase;
+    div.textContent = texto;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function mostrarHerramientas(herramientas) {
+    for (const item of herramientas || []) {
+      const div = document.createElement("div");
+      div.className = "tool";
+
+      const titulo = document.createElement("strong");
+      titulo.textContent = "Herramienta ejecutada: " + item.herramienta;
+      div.appendChild(titulo);
+
+      const argumentos = document.createElement("pre");
+      argumentos.textContent = "Argumentos:\n" +
+        JSON.stringify(item.argumentos, null, 2);
+      div.appendChild(argumentos);
+
+      const resultado = document.createElement("pre");
+      let contenido = item.resultado;
+
+      try {
+        contenido = JSON.stringify(JSON.parse(item.resultado), null, 2);
+      } catch {}
+
+      resultado.textContent = "Resultado:\n" + contenido;
+      div.appendChild(resultado);
+
+      chat.appendChild(div);
+    }
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function comprobarServidor() {
+    try {
+      const r = await fetch("/api/health");
+      if (!r.ok) throw new Error("Servidor no disponible");
+      status.textContent = "● Servicio disponible";
+    } catch {
+      status.textContent = "● Servidor desconectado";
+      status.style.color = "#bd3b3b";
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const message = input.value.trim();
+    if (!message || send.disabled) return;
+
+    agregarMensaje(message, "user");
+    input.value = "";
+    send.disabled = true;
+    thinking.hidden = false;
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, sessionId })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "Error procesando la solicitud");
+      }
+
+      sessionId = data.sessionId;
+
+      mostrarHerramientas(data.herramientas);
+
+      const respuesta = String(data.respuesta || "Sin respuesta del agente.");
+      agregarMensaje(respuesta, "assistant");
+
+      if (/confirmaci[oó]n|confirmar|¿deseas|¿quieres/i.test(respuesta)) {
+        const aviso = document.createElement("div");
+        aviso.className = "confirmation";
+        aviso.textContent = "Se requiere confirmación del usuario antes de continuar con la acción indicada.";
+        chat.appendChild(aviso);
+      }
+
+    } catch (error) {
+      agregarMensaje("Error: " + error.message, "assistant");
+    } finally {
+      thinking.hidden = true;
+      send.disabled = false;
+      input.focus();
+      chat.scrollTop = chat.scrollHeight;
+    }
+  });
+
+  comprobarServidor();
+  setInterval(comprobarServidor, 30000);
+</script>
+</body>
+</html>
