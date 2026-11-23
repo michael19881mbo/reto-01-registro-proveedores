@@ -1,4 +1,3 @@
-
 import {
   proveedor_leer_solicitud,
   proveedor_mapear_campos,
@@ -12,22 +11,36 @@ type Context = {
   sessionId: string;
 };
 
+type ResultadoHerramienta<T = Record<string, unknown>> =
+  | { ok: true; data: T }
+  | { ok: false; error: string };
+
 type EstadoSesion = {
   caso: string;
-  documentosListos: boolean;
-  formularioListo: boolean;
   listoParaFirma: boolean;
+  camposPorConfirmar: number;
+};
+
+type Herramienta = {
+  execute: (args: Record<string, unknown>, ctx: Context) => Promise<string>;
+};
+
+type LogHerramienta = {
+  herramienta: string;
+  argumentos: Record<string, unknown>;
+  ok: boolean;
+  resumen: string;
 };
 
 const estadosSesiones = new Map<string, EstadoSesion>();
 
-const herramientas: Record<string, any> = {
+const herramientas: Record<string, Herramienta> = {
   proveedor_leer_solicitud,
   proveedor_mapear_campos,
   proveedor_generar_formulario,
   proveedor_armar_paquete,
   proveedor_simular_envio,
-};
+} as unknown as Record<string, Herramienta>;
 
 const casosDisponibles = [
   "co-industrias-delta",
@@ -36,45 +49,90 @@ const casosDisponibles = [
   "pa-logistica-istmo",
 ];
 
-function interpretarResultado(resultado: string): any {
+function interpretarResultado<T>(
+  resultado: string
+): ResultadoHerramienta<T> {
   try {
-    return JSON.parse(resultado);
+    const parsed: unknown = JSON.parse(resultado);
+
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "ok" in parsed &&
+      parsed.ok === true &&
+      "data" in parsed
+    ) {
+      return parsed as ResultadoHerramienta<T>;
+    }
+
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "ok" in parsed &&
+      parsed.ok === false
+    ) {
+      const error =
+        "error" in parsed && typeof parsed.error === "string"
+          ? parsed.error
+          : "La herramienta informó un error sin descripción.";
+
+      return { ok: false, error };
+    }
+
+    return {
+      ok: false,
+      error: "La herramienta devolvió una estructura de respuesta inválida.",
+    };
   } catch {
     return {
       ok: false,
-      error: "La herramienta devolvió una respuesta inválida.",
+      error: "La herramienta devolvió una respuesta que no es JSON válido.",
     };
   }
 }
 
-async function ejecutarHerramienta(
+async function ejecutarHerramienta<T>(
   nombre: string,
-  argumentos: any,
+  argumentos: Record<string, unknown>,
   ctx: Context,
-  logs: any[]
-): Promise<any> {
+  logs: LogHerramienta[]
+): Promise<ResultadoHerramienta<T>> {
   const herramienta = herramientas[nombre];
 
   if (!herramienta) {
-    throw new Error(`Herramienta desconocida: ${nombre}`);
+    const error = `Herramienta desconocida: ${nombre}`;
+    logs.push({ herramienta: nombre, argumentos, ok: false, resumen: error });
+    return { ok: false, error };
   }
 
-  const resultado = await herramienta.execute(argumentos, ctx);
-  const datos = interpretarResultado(resultado);
+  try {
+    const resultado = await herramienta.execute(argumentos, ctx);
+    const datos = interpretarResultado<T>(resultado);
 
-  logs.push({
-    herramienta: nombre,
-    argumentos,
-    resultado,
-  });
+    logs.push({
+      herramienta: nombre,
+      argumentos,
+      ok: datos.ok,
+      resumen: datos.ok ? "Ejecución correcta" : datos.error,
+    });
 
-  return datos;
+    return datos;
+  } catch (error) {
+    const mensaje =
+      error instanceof Error ? error.message : "Error inesperado.";
+
+    logs.push({
+      herramienta: nombre,
+      argumentos,
+      ok: false,
+      resumen: mensaje,
+    });
+
+    return { ok: false, error: mensaje };
+  }
 }
 
-function respuesta(
-  mensaje: string,
-  logs: any[] = []
-) {
+function respuesta(mensaje: string, logs: LogHerramienta[] = []) {
   return {
     respuesta: mensaje,
     historial: [],
@@ -82,114 +140,29 @@ function respuesta(
   };
 }
 
+function cantidad<T>(valor: T[] | undefined): number {
+  return Array.isArray(valor) ? valor.length : 0;
+}
+
 export async function ejecutarAgenteLocal(
   mensaje: string,
   sessionId: string,
   directory: string
 ) {
-  const ctx: Context = {
-    directory,
-    sessionId,
-  };
-
+  const ctx: Context = { directory, sessionId };
   const texto = mensaje.toLowerCase().trim();
-  const logs: any[] = [];
+  const logs: LogHerramienta[] = [];
 
   try {
-    // Identificar el caso mencionado.
-    const caso = casosDisponibles.find((id) =>
-      texto.includes(id)
-    );
-
-    // Consultar estado documental sin regenerar el registro.
-    const esConsultaEstado =
-      /\b(estado|consulta|consultar|verificar|revisar|checklist|documentos|soportes|vencidos|vencido|faltantes|faltante)\b/i.test(texto) ||
-      texto.includes("listo para firma");
-
-    if (esConsultaEstado && caso) {
-      const paquete = await ejecutarHerramienta(
-        "proveedor_armar_paquete",
-        { caso },
-        ctx,
-        logs
-      );
-
-      if (!paquete.ok) {
-        return respuesta(
-          `No fue posible consultar el estado documental: ${paquete.error}`,
-          logs
-        );
-      }
-
-      const checklist = paquete.data.checklist ?? [];
-
-      const vencidos = checklist.filter(
-        (item: any) => item.vencido
-      );
-
-      const faltantes = checklist.filter(
-        (item: any) => !item.disponible
-      );
-
-      // La consulta documental actualiza solo el estado de los soportes.
-      // La validación del formulario se conserva desde el registro inicial.
-      const estadoAnterior = estadosSesiones.get(sessionId);
-      const mismoCaso = estadoAnterior?.caso === caso;
-
-      const documentosListos =
-        paquete.data.listo_para_firma === true;
-
-      const formularioListo =
-        mismoCaso && estadoAnterior?.formularioListo === true;
-
-      const listoParaFirma =
-        documentosListos && formularioListo;
-
-      estadosSesiones.set(sessionId, {
-        caso,
-        documentosListos,
-        formularioListo,
-        listoParaFirma,
-      });
-
-      const lineas = [
-        "ESTADO DOCUMENTAL DEL PROVEEDOR",
-        "",
-        ...checklist.map((item: any) => {
-          const estado = !item.disponible
-            ? "NO DISPONIBLE"
-            : item.vencido
-              ? "VENCIDO"
-              : "DISPONIBLE";
-
-          return `- ${item.soporte}: ${estado}`;
-        }),
-        "",
-        `Documentos vencidos: ${vencidos.length}`,
-        `Documentos faltantes: ${faltantes.length}`,
-        `Listo para firma: ${listoParaFirma ? "Sí" : "No"}`,
-        "",
-        listoParaFirma
-          ? "El paquete documental está listo para continuar."
-          : "El registro está bloqueado para firma y envío simulado.",
-        "",
-        "No se ha realizado ningún envío real.",
-      ];
-
-      return respuesta(lineas.join("\n"), logs);
-    }
-
-    // Confirmación explícita de envío.
-    const esConfirmacion =
-      /^confirmar\s+env[ií]o\b/i.test(texto);
+    const caso = casosDisponibles.find((id) => texto.includes(id));
+    const esConfirmacion = /^confirmar\s+env[ií]o\b/i.test(texto);
 
     if (esConfirmacion) {
       const estado = estadosSesiones.get(sessionId);
 
       if (!estado) {
         return respuesta(
-          "No existe un registro preparado en esta sesión. " +
-          "Primero debes iniciar y preparar el registro del proveedor."
+          "No existe un registro preparado en esta sesión. Inicia primero el procesamiento del caso."
         );
       }
 
@@ -199,18 +172,21 @@ export async function ejecutarAgenteLocal(
         );
       }
 
-      if (!estado.listoParaFirma) {
+      if (estado.camposPorConfirmar > 0) {
         return respuesta(
-          "No se puede simular el envío: existen soportes faltantes o vencidos, campos obligatorios pendientes o campos por validar."
+          `El envío sigue bloqueado: hay ${estado.camposPorConfirmar} campo(s) que requieren confirmación antes de continuar.`
         );
       }
 
-      const envio = await ejecutarHerramienta(
+      if (!estado.listoParaFirma) {
+        return respuesta(
+          "El envío sigue bloqueado porque el paquete documental contiene soportes faltantes, inexistentes o vencidos."
+        );
+      }
+
+      const envio = await ejecutarHerramienta<{ ruta: string }>(
         "proveedor_simular_envio",
-        {
-          caso: estado.caso,
-          confirmado: true,
-        },
+        { caso: estado.caso, confirmado: true },
         ctx,
         logs
       );
@@ -225,60 +201,47 @@ export async function ejecutarAgenteLocal(
       estadosSesiones.delete(sessionId);
 
       return respuesta(
-        "La simulación del envío se completó correctamente.\n\n" +
-        "No se realizó ningún envío real ni firma digital.",
+        `La simulación del envío se completó correctamente.\nArchivo: ${envio.data.ruta}\n\nNo se realizó ningún envío real ni firma digital.`,
         logs
       );
     }
 
-    // Si no se identifica el caso, solicitarlo.
     if (!caso) {
       return respuesta(
         "Para iniciar el registro, indica uno de estos casos:\n\n" +
-        casosDisponibles.map((id) => `- ${id}`).join("\n")
+          casosDisponibles.map((id) => `- ${id}`).join("\n")
       );
     }
 
-    // 1. Leer solicitud.
-    const lectura = await ejecutarHerramienta(
-      "proveedor_leer_solicitud",
-      { caso },
-      ctx,
-      logs
-    );
+    const lectura = await ejecutarHerramienta<{
+      pais: string;
+      cliente: string;
+      formato: string;
+      campos: Array<Record<string, unknown>>;
+    }>("proveedor_leer_solicitud", { caso }, ctx, logs);
 
     if (!lectura.ok) {
-      return respuesta(
-        `No fue posible leer la solicitud: ${lectura.error}`,
-        logs
-      );
+      return respuesta(`No fue posible leer la solicitud: ${lectura.error}`, logs);
     }
 
-    // 2. Mapear campos.
-    const mapeo = await ejecutarHerramienta(
+    const mapeo = await ejecutarHerramienta<{
+      llenos?: unknown[];
+      faltantes?: unknown[];
+      requiere_confirmacion?: unknown[];
+    }>(
       "proveedor_mapear_campos",
-      {
-        caso,
-        campos: lectura.data.campos,
-      },
+      { caso, campos: lectura.data.campos },
       ctx,
       logs
     );
 
     if (!mapeo.ok) {
-      return respuesta(
-        `No fue posible mapear los campos: ${mapeo.error}`,
-        logs
-      );
+      return respuesta(`No fue posible mapear los campos: ${mapeo.error}`, logs);
     }
 
-    // 3. Generar formulario.
-    const formulario = await ejecutarHerramienta(
+    const formulario = await ejecutarHerramienta<{ ruta: string; formato: string }>(
       "proveedor_generar_formulario",
-      {
-        caso,
-        mapeo: mapeo.data,
-      },
+      { caso, mapeo: mapeo.data },
       ctx,
       logs
     );
@@ -290,110 +253,60 @@ export async function ejecutarAgenteLocal(
       );
     }
 
-    // 4. Preparar paquete documental.
-    const paquete = await ejecutarHerramienta(
-      "proveedor_armar_paquete",
-      { caso },
-      ctx,
-      logs
-    );
+    const paquete = await ejecutarHerramienta<{
+      ruta: string;
+      listo_para_firma: boolean;
+      checklist?: unknown[];
+    }>("proveedor_armar_paquete", { caso }, ctx, logs);
 
     if (!paquete.ok) {
       return respuesta(
-        `No fue posible preparar el paquete: ${paquete.error}`,
+        `No fue posible preparar el paquete documental: ${paquete.error}`,
         logs
       );
     }
 
-    // Evaluar campos del formulario.
-    const camposLlenos =
-      mapeo.data.llenos?.length ?? 0;
-
-    const camposFaltantes =
-      mapeo.data.faltantes?.length ?? 0;
-
-    const camposPorValidar =
-      mapeo.data.por_validar?.length ?? 0;
-
-    const camposPendientesValidacion =
-      mapeo.data.por_validar ?? [];
-
-    // Evaluar documentación.
-    const documentosListos =
-      paquete.data.listo_para_firma === true;
-
-    // El formulario no se considera listo si hay campos
-    // obligatorios pendientes o cuya obligatoriedad se desconoce.
-    const formularioListo =
-      camposFaltantes === 0 &&
-      camposPorValidar === 0;
+    const camposLlenos = cantidad(mapeo.data.llenos);
+    const camposFaltantes = cantidad(mapeo.data.faltantes);
+    const camposPorConfirmar = cantidad(mapeo.data.requiere_confirmacion);
 
     const listoParaFirma =
-      documentosListos && formularioListo;
+      paquete.data.listo_para_firma === true &&
+      camposFaltantes === 0 &&
+      camposPorConfirmar === 0;
 
-    // Guardar el estado de la sesión.
     estadosSesiones.set(sessionId, {
       caso,
-      documentosListos,
-      formularioListo,
       listoParaFirma,
+      camposPorConfirmar,
     });
 
-    const mensajeRespuesta = [
-      "Registro procesado correctamente.",
+    const resumen = [
+      "Registro procesado.",
       "",
       `Cliente: ${lectura.data.cliente}`,
       `País: ${lectura.data.pais}`,
-      `Formato: ${lectura.data.formato}`,
+      `Formato solicitado: ${lectura.data.formato}`,
       "",
       `Campos completados: ${camposLlenos}`,
-      `Campos obligatorios pendientes: ${camposFaltantes}`,
-      `Campos por validar: ${camposPorValidar}`,
-      ...(
-        camposPorValidar > 0
-          ? [
-              "",
-              "Campos que requieren revisión humana:",
-              ...camposPendientesValidacion.map(
-                (item: any) => `- ${item.campo}`
-              ),
-            ]
-          : []
-      ),
-      "",
-      "Formulario: Generado",
-      "Paquete documental: Generado",
-      `Documentación lista: ${documentosListos ? "Sí" : "No"}`,
+      `Campos faltantes: ${camposFaltantes}`,
+      `Campos que requieren confirmación: ${camposPorConfirmar}`,
+      `Formulario generado: ${formulario.data.ruta}`,
+      `Paquete documental: ${paquete.data.ruta}`,
       `Listo para firma: ${listoParaFirma ? "Sí" : "No"}`,
       "",
       listoParaFirma
-        ? "El registro está preparado. Para continuar, escribe: CONFIRMAR ENVIO"
-        : "El registro está bloqueado. Revisa los soportes documentales y los campos pendientes o por validar.",
+        ? "El paquete cumple las validaciones registradas. Para ejecutar la simulación, escribe CONFIRMAR ENVIO."
+        : "No se puede continuar a firma/envío. Revisa los campos pendientes, las confirmaciones y el checklist documental.",
       "",
-      "No se ha realizado ningún envío real.",
+      "No se ha realizado ningún envío real ni firma digital.",
     ].join("\n");
 
-    // Solicitudes de simulación sin confirmación.
-    if (
-      texto.includes("simular envio") ||
-      texto.includes("simular envío")
-    ) {
-      return respuesta(
-        listoParaFirma
-          ? mensajeRespuesta
-          : "No es posible solicitar el envío simulado porque el registro no está listo para firma.",
-        logs
-      );
-    }
-
-    return respuesta(mensajeRespuesta, logs);
-
+    return respuesta(resumen, logs);
   } catch (error) {
-    return respuesta(
-      error instanceof Error
-        ? `Error en el agente local: ${error.message}`
-        : "Error inesperado en el agente local.",
-      logs
-    );
+    const mensaje =
+      error instanceof Error ? error.message : "Error inesperado.";
+
+    return respuesta(`Error en el agente local: ${mensaje}`, logs);
   }
 }

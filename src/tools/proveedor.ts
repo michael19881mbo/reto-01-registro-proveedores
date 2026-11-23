@@ -1,4 +1,3 @@
-
 import { z } from "zod";
 import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
@@ -9,25 +8,96 @@ type Context = {
   sessionId: string;
 };
 
-const casoSchema = z.string().min(1).describe("Identificador del caso");
+type CampoPlantilla = {
+  etiqueta?: string;
+  nombre?: string;
+  campo?: string;
+  obligatorio?: boolean;
+  hoja?: string;
+  celda_etiqueta?: string;
+  celda_valor?: string;
+};
 
-async function leerJson(ruta: string): Promise<any> {
-  return JSON.parse(await fs.readFile(ruta, "utf8"));
+type DatoMaestro = Record<string, unknown>;
+
+type MapeoCampo = {
+  campo: string;
+  valor?: unknown;
+  valor_propuesto?: unknown;
+  identificador_requerido?: string;
+  origen?: string;
+  motivo?: string;
+  nota?: string;
+};
+
+type Mapeo = {
+  llenos: MapeoCampo[];
+  faltantes: MapeoCampo[];
+  opcionales_no_informados: MapeoCampo[];
+  por_validar: MapeoCampo[];
+  requiere_confirmacion: MapeoCampo[];
+};
+
+type Soporte = {
+  tipo: string;
+  archivo?: string;
+  vigencia_hasta?: string | null;
+  descripcion?: string;
+};
+
+type ChecklistItem = {
+  soporte: string;
+  disponible: boolean;
+  vencido: boolean;
+  vigencia_hasta: string | null;
+  descripcion: string;
+};
+
+const casoSchema = z
+  .string()
+  .regex(/^[a-z0-9-]+$/i, "Identificador de caso inválido.")
+  .min(1)
+  .describe("Identificador del caso");
+
+const campoSchema = z.record(z.string(), z.unknown());
+const mapeoItemSchema = z.object({
+  campo: z.string(),
+  valor: z.unknown().optional(),
+  valor_propuesto: z.unknown().optional(),
+  origen: z.string().optional(),
+  motivo: z.string().optional(),
+  nota: z.string().optional(),
+  identificador_requerido: z.string().optional(),
+}).passthrough();
+
+const mapeoSchema = z.object({
+  llenos: z.array(mapeoItemSchema),
+  faltantes: z.array(mapeoItemSchema),
+  opcionales_no_informados: z.array(mapeoItemSchema),
+  por_validar: z.array(mapeoItemSchema),
+  requiere_confirmacion: z.array(mapeoItemSchema),
+});
+
+function esObjeto(valor: unknown): valor is Record<string, unknown> {
+  return typeof valor === "object" && valor !== null && !Array.isArray(valor);
 }
 
-function respuesta(data: unknown) {
+async function leerJson<T>(ruta: string): Promise<T> {
+  return JSON.parse(await fs.readFile(ruta, "utf8")) as T;
+}
+
+function respuesta(data: unknown): string {
   return JSON.stringify({ ok: true, data });
 }
 
-function errorRespuesta(error: unknown) {
+function errorRespuesta(error: unknown): string {
   return JSON.stringify({
     ok: false,
-    error: error instanceof Error ? error.message : "Error inesperado",
+    error: error instanceof Error ? error.message : "Error inesperado.",
   });
 }
 
 async function ejecutar(
-  ctx: Context,
   accion: () => Promise<unknown>
 ): Promise<string> {
   try {
@@ -40,7 +110,6 @@ async function ejecutar(
 async function rutasCaso(ctx: Context, caso: string) {
   const base = path.join(ctx.directory, "fixtures", "reto-01");
   const carpeta = path.join(base, "casos", caso);
-
   return {
     base,
     carpeta,
@@ -51,144 +120,145 @@ async function rutasCaso(ctx: Context, caso: string) {
   };
 }
 
-function obtenerValor(obj: any, ruta: string): any {
-  return ruta.split(".").reduce((actual, clave) => actual?.[clave], obj);
+function obtenerValor(objeto: unknown, ruta: string): unknown {
+  return ruta.split(".").reduce<unknown>((actual, clave) => {
+    if (!esObjeto(actual)) return undefined;
+    return actual[clave];
+  }, objeto);
 }
 
-function estadoCampo(mapeo: any, etiqueta: string): string {
-  if (mapeo.llenos?.some((item: any) => item.campo === etiqueta)) {
+function textoCampo(campo: CampoPlantilla): string {
+  const etiqueta = campo.etiqueta ?? campo.nombre ?? campo.campo;
+  if (typeof etiqueta !== "string" || etiqueta.trim() === "") {
+    throw new Error("La plantilla contiene un campo sin etiqueta válida.");
+  }
+  return etiqueta;
+}
+
+function valorVacio(valor: unknown): boolean {
+  return valor === undefined || valor === null || valor === "";
+}
+
+function lista(mapeo: Mapeo, clave: keyof Mapeo): MapeoCampo[] {
+  const valor = mapeo[clave];
+  return Array.isArray(valor) ? valor : [];
+}
+
+function estadoCampo(mapeo: Mapeo, etiqueta: string): string {
+  if (lista(mapeo, "requiere_confirmacion").some((item) => item.campo === etiqueta)) {
+    return "REQUIERE CONFIRMACIÓN";
+  }
+  if (lista(mapeo, "llenos").some((item) => item.campo === etiqueta)) {
     return "COMPLETADO";
   }
-
-  if (
-    mapeo.opcionales_no_informados?.some(
-      (item: any) => item.campo === etiqueta
-    )
-  ) {
+  if (lista(mapeo, "opcionales_no_informados").some((item) => item.campo === etiqueta)) {
     return "NO INFORMADO (OPCIONAL)";
   }
-
-  if (
-    mapeo.por_validar?.some(
-      (item: any) => item.campo === etiqueta
-    )
-  ) {
+  if (lista(mapeo, "por_validar").some((item) => item.campo === etiqueta)) {
     return "POR VALIDAR OBLIGATORIEDAD";
   }
-
-  if (
-    mapeo.faltantes?.some(
-      (item: any) => item.campo === etiqueta
-    )
-  ) {
+  if (lista(mapeo, "faltantes").some((item) => item.campo === etiqueta)) {
     return "PENDIENTE";
   }
-
   return "SIN CLASIFICAR";
 }
 
-/**
- * Revalida los requisitos desde los fixtures y el sistema de archivos.
- * Esta comprobación es independiente del estado mantenido por el agente.
- */
-async function validarElegibilidadEnvio(
-  ctx: Context,
-  caso: string
-): Promise<void> {
-  const r = await rutasCaso(ctx, caso);
-  const solicitud = await leerJson(r.solicitud);
-  const exigidos = await leerJson(
-    path.join(r.carpeta, "soportes-exigidos.json")
+function valorCampo(mapeo: Mapeo, etiqueta: string): unknown {
+  return lista(mapeo, "llenos").find((item) => item.campo === etiqueta)?.valor;
+}
+
+function esCampoIdentificacionTributaria(etiqueta: string): boolean {
+  return /^(nit|ruc|rtn|identificación tributaria|número de identificación fiscal)$/i.test(
+    etiqueta.trim()
   );
-  const indice = await leerJson(r.soportes);
+}
+
+function identificadorPais(pais: string): string | undefined {
+  const identificadores: Record<string, string> = {
+    CO: "NIT",
+    EC: "RUC",
+    PE: "RUC",
+    PA: "RUC",
+    HN: "RTN",
+  };
+  return identificadores[pais.toUpperCase()];
+}
+
+async function cargarPlantilla(
+  carpeta: string,
+  formato: string
+): Promise<CampoPlantilla[]> {
+  const nombre = formato === "xlsx" ? "plantilla-celdas.json" : "plantilla-campos.json";
+  const campos = await leerJson<unknown>(path.join(carpeta, nombre));
+  if (!Array.isArray(campos)) {
+    throw new Error(`La plantilla ${nombre} no contiene una lista de campos válida.`);
+  }
+  return campos.map((campo) => {
+    if (!esObjeto(campo)) {
+      throw new Error("La plantilla contiene una definición de campo inválida.");
+    }
+    return campo as CampoPlantilla;
+  });
+}
+
+function fechaVencida(vigencia: string | null | undefined, hoy: Date): boolean {
+  if (!vigencia) return false;
+  const fecha = new Date(`${vigencia}T23:59:59`);
+  return Number.isNaN(fecha.getTime()) || fecha < hoy;
+}
+
+async function validarElegibilidadEnvio(ctx: Context, caso: string): Promise<void> {
+  const rutas = await rutasCaso(ctx, caso);
+  const solicitud = await leerJson<{ pais: string; formato: string }>(rutas.solicitud);
+  const exigidos = await leerJson<string[]>(
+    path.join(rutas.carpeta, "soportes-exigidos.json")
+  );
+  const indice = await leerJson<Soporte[]>(rutas.soportes);
   const errores: string[] = [];
   const hoy = new Date();
-
-  // Validar existencia, copia y vigencia de cada soporte exigido.
-  const carpetaPaquete = path.join(
-    ctx.directory,
-    "out",
-    caso,
-    "paquete"
-  );
+  const carpetaPaquete = path.join(ctx.directory, "out", caso, "paquete");
 
   for (const tipo of exigidos) {
-    const soporte = indice.find((item: any) => item.tipo === tipo);
-
+    const soporte = indice.find((item) => item.tipo === tipo);
     if (!soporte?.archivo) {
       errores.push(`Soporte no disponible: ${tipo}`);
       continue;
     }
 
-    const rutaOrigen = path.join(
-      r.base,
-      "repositorio",
-      "soportes",
-      soporte.archivo
-    );
-    const rutaCopia = path.join(carpetaPaquete, soporte.archivo);
+    const origen = path.join(rutas.base, "repositorio", "soportes", soporte.archivo);
+    const copia = path.join(carpetaPaquete, soporte.archivo);
 
     try {
-      await fs.access(rutaOrigen);
-      await fs.access(rutaCopia);
+      await fs.access(origen);
+      await fs.access(copia);
     } catch {
       errores.push(`Archivo de soporte ausente: ${tipo}`);
       continue;
     }
 
-    if (soporte.vigencia_hasta) {
-      const fechaVigencia = new Date(`${soporte.vigencia_hasta}T23:59:59`);
-      if (
-        Number.isNaN(fechaVigencia.getTime()) ||
-        fechaVigencia < hoy
-      ) {
-        errores.push(`Soporte vencido o con vigencia inválida: ${tipo}`);
-      }
+    if (fechaVencida(soporte.vigencia_hasta, hoy)) {
+      errores.push(`Soporte vencido o con vigencia inválida: ${tipo}`);
     }
   }
 
-  // Reconstruir la clasificación de campos directamente desde las fuentes.
-  const maestro = await leerJson(r.maestro);
-  const glosario = await leerJson(r.glosario);
-  const archivoCampos = path.join(
-    r.carpeta,
-    solicitud.formato === "xlsx"
-      ? "plantilla-celdas.json"
-      : "plantilla-campos.json"
-  );
-  const campos = await leerJson(archivoCampos);
-
-  for (const campo of campos) {
-    const etiqueta = campo.etiqueta ?? campo.nombre ?? campo.campo;
-    const rutaDato = glosario[etiqueta];
-    const valor = rutaDato
-      ? obtenerValor(maestro, rutaDato)
-      : undefined;
-    const sinValor =
-      valor === undefined || valor === null || valor === "";
-
-    if (!sinValor) continue;
-
-    if (campo.obligatorio === true) {
-      errores.push(`Campo obligatorio pendiente: ${etiqueta}`);
-    } else if (campo.obligatorio !== false) {
-      errores.push(`Campo por validar: ${etiqueta}`);
+  // RN1: un NIT colombiano no se considera RUC/RTN válido en otro país.
+  // El valor puede proponerse, pero requiere confirmación humana antes de simular envío.
+  if (solicitud.pais.toUpperCase() !== "CO") {
+    const idPais = identificadorPais(solicitud.pais);
+    if (idPais) {
+      errores.push(
+        `Identificador tributario pendiente de confirmación: el maestro solo contiene NIT colombiano y el país ${solicitud.pais} requiere ${idPais}.`
+      );
     }
   }
 
-  // Verificar que exista el artefacto generado para el formato del caso.
   const nombreFormulario =
     solicitud.formato === "xlsx"
       ? "formulario.xlsx"
       : solicitud.formato === "pdf"
         ? "formulario.pdf"
         : "valores-portal.md";
-  const rutaFormulario = path.join(
-    ctx.directory,
-    "out",
-    caso,
-    nombreFormulario
-  );
+  const rutaFormulario = path.join(ctx.directory, "out", caso, nombreFormulario);
 
   try {
     const info = await fs.stat(rutaFormulario);
@@ -202,45 +272,35 @@ async function validarElegibilidadEnvio(
   if (errores.length > 0) {
     throw new Error(
       "No se puede simular el envío. Validaciones incumplidas:\n- " +
-      errores.join("\n- ")
+        errores.join("\n- ")
     );
   }
 }
 
 export const proveedor_leer_solicitud = {
   description: "Lee la solicitud de registro y sus requisitos.",
+  args: { caso: casoSchema },
 
-  args: {
-    caso: casoSchema,
-  },
-
-  async execute(
-    args: { caso: string },
-    ctx: Context
-  ): Promise<string> {
-    return ejecutar(ctx, async () => {
-      const r = await rutasCaso(ctx, args.caso);
-      const solicitud = await leerJson(r.solicitud);
-      const maestro = await leerJson(r.maestro);
-
-      const exigidos = await leerJson(
-        path.join(r.carpeta, "soportes-exigidos.json")
+  async execute(args: { caso: string }, ctx: Context): Promise<string> {
+    return ejecutar(async () => {
+      const rutas = await rutasCaso(ctx, args.caso);
+      const solicitud = await leerJson<{
+        pais: string;
+        cliente: string;
+        formato: string;
+        de: string;
+      }>(rutas.solicitud);
+      const maestro = await leerJson<DatoMaestro>(rutas.maestro);
+      const exigidos = await leerJson<string[]>(
+        path.join(rutas.carpeta, "soportes-exigidos.json")
       );
+      const campos = await cargarPlantilla(rutas.carpeta, solicitud.formato);
 
       return {
         pais: solicitud.pais,
         cliente: solicitud.cliente,
         formato: solicitud.formato,
-
-        campos: await leerJson(
-          path.join(
-            r.carpeta,
-            solicitud.formato === "xlsx"
-              ? "plantilla-celdas.json"
-              : "plantilla-campos.json"
-          )
-        ),
-
+        campos,
         soportes: exigidos,
         datos_disponibles: Object.keys(maestro),
       };
@@ -249,382 +309,337 @@ export const proveedor_leer_solicitud = {
 };
 
 export const proveedor_mapear_campos = {
-  description: "Relaciona los campos solicitados con el maestro de proveedores.",
-
+  description:
+    "Relaciona los campos solicitados con el maestro. Los identificadores extranjeros se proponen como NIT colombiano y requieren confirmación.",
   args: {
     caso: casoSchema,
-    campos: z.array(z.any()).describe("Campos extraídos de la solicitud"),
+    campos: z.array(campoSchema).describe("Campos extraídos de la solicitud"),
   },
 
   async execute(
-    args: { caso: string; campos: any[] },
+    args: { caso: string; campos: Array<Record<string, unknown>> },
     ctx: Context
   ): Promise<string> {
-    return ejecutar(ctx, async () => {
-      const r = await rutasCaso(ctx, args.caso);
+    return ejecutar(async () => {
+      const rutas = await rutasCaso(ctx, args.caso);
+      const solicitud = await leerJson<{ pais: string }>(rutas.solicitud);
+      const maestro = await leerJson<DatoMaestro>(rutas.maestro);
+      const glosario = await leerJson<Record<string, string>>(rutas.glosario);
 
-      const maestro = await leerJson(r.maestro);
-      const glosario = await leerJson(r.glosario);
+      const resultado: Mapeo = {
+        llenos: [],
+        faltantes: [],
+        opcionales_no_informados: [],
+        por_validar: [],
+        requiere_confirmacion: [],
+      };
 
-      const llenos: any[] = [];
-      const faltantes: any[] = [];
-      const opcionales_no_informados: any[] = [];
-      const por_validar: any[] = [];
-      const requiere_confirmacion: any[] = [];
+      const pais = solicitud.pais.toUpperCase();
+      const idEsperado = identificadorPais(pais);
 
-      for (const campo of args.campos) {
-        const etiqueta =
-          campo.etiqueta ?? campo.nombre ?? campo.campo;
-
+      for (const entrada of args.campos) {
+        const campo = entrada as CampoPlantilla;
+        const etiqueta = textoCampo(campo);
         const ruta = glosario[etiqueta];
-        const valor = ruta
-          ? obtenerValor(maestro, ruta)
-          : undefined;
+        const valor = ruta ? obtenerValor(maestro, ruta) : undefined;
+        const obligatorio = campo.obligatorio;
 
-        const obligatoriedad = campo.obligatorio;
-
-        if (
-          valor === undefined ||
-          valor === null ||
-          valor === ""
-        ) {
-          const detalle = {
-            campo: etiqueta,
-            motivo: ruta
-              ? "Sin dato en maestro"
-              : "Sin correspondencia en glosario",
-          };
-
-          if (obligatoriedad === true) {
-            faltantes.push(detalle);
-          } else if (obligatoriedad === false) {
-            opcionales_no_informados.push(detalle);
-          } else {
-            por_validar.push({
-              ...detalle,
-              motivo:
-                `${detalle.motivo}. ` +
-                "Obligatoriedad no definida en la plantilla",
-            });
-          }
-        } else {
-          llenos.push({
+        if (esCampoIdentificacionTributaria(etiqueta) && pais !== "CO" && valor !== undefined) {
+          const nota =
+            `El maestro solo contiene NIT colombiano (${String(valor)}). ` +
+            `El país ${pais} requiere ${idEsperado ?? "un identificador tributario local"}. ` +
+            "No se afirma equivalencia legal; requiere validación del usuario.";
+          resultado.llenos.push({
             campo: etiqueta,
             valor,
-            origen: ruta,
+            origen: ruta ?? "maestro.nit",
+            nota,
           });
+          resultado.requiere_confirmacion.push({
+            campo: etiqueta,
+            valor_propuesto: valor,
+            identificador_requerido: idEsperado,
+            motivo: "identificador extranjero",
+            nota,
+          });
+          continue;
         }
+
+        if (valorVacio(valor)) {
+          const detalle: MapeoCampo = {
+            campo: etiqueta,
+            motivo: ruta ? "Sin dato en maestro" : "Sin correspondencia en glosario",
+          };
+          if (obligatorio === true) {
+            resultado.faltantes.push(detalle);
+          } else if (obligatorio === false) {
+            resultado.opcionales_no_informados.push(detalle);
+          } else {
+            resultado.por_validar.push({
+              ...detalle,
+              motivo: `${detalle.motivo}. Obligatoriedad no definida en la plantilla.`,
+            });
+          }
+          continue;
+        }
+
+        resultado.llenos.push({
+          campo: etiqueta,
+          valor,
+          origen: ruta,
+        });
       }
 
-      return {
-        llenos,
-        faltantes,
-        opcionales_no_informados,
-        por_validar,
-        requiere_confirmacion,
-      };
+      return resultado;
     });
   },
 };
 
 export const proveedor_generar_formulario = {
-  description: "Genera el formulario de registro en Excel o PDF.",
-
+  description: "Genera el formulario Excel o PDF, o la lista de valores para portal.",
   args: {
     caso: casoSchema,
-    mapeo: z.any().describe("Resultado del mapeo de campos"),
+    mapeo: mapeoSchema.describe("Resultado del mapeo de campos"),
   },
 
   async execute(
-    args: { caso: string; mapeo: any },
+    args: { caso: string; mapeo: Mapeo },
     ctx: Context
   ): Promise<string> {
-    return ejecutar(ctx, async () => {
-      const r = await rutasCaso(ctx, args.caso);
-
-      const solicitud = await leerJson(r.solicitud);
-
-      const salida = path.join(
-        ctx.directory,
-        "out",
-        args.caso
-      );
-
+    return ejecutar(async () => {
+      const rutas = await rutasCaso(ctx, args.caso);
+      const solicitud = await leerJson<{ formato: string }>(rutas.solicitud);
+      const salida = path.join(ctx.directory, "out", args.caso);
       await fs.mkdir(salida, { recursive: true });
 
-      // GENERACIÓN EXCEL
       if (solicitud.formato === "xlsx") {
         const ExcelJS = (await import("exceljs")).default;
-
-        const celdas = await leerJson(
-          path.join(r.carpeta, "plantilla-celdas.json")
-        );
-
+        const celdas = await cargarPlantilla(rutas.carpeta, "xlsx");
         const libro = new ExcelJS.Workbook();
+        const hojas = [...new Set(celdas.map((campo) => campo.hoja).filter(
+          (nombre): nombre is string => typeof nombre === "string" && nombre.length > 0
+        ))];
 
-        const hojaNombres: string[] = [
-          ...new Set<string>(
-            celdas.map((c: any) => String(c.hoja))
-          ),
-        ];
-
-        for (const nombre of hojaNombres) {
-          libro.addWorksheet(nombre);
-        }
+        for (const nombre of hojas) libro.addWorksheet(nombre);
 
         for (const campo of celdas) {
+          if (!campo.hoja || !campo.celda_etiqueta || !campo.celda_valor) {
+            throw new Error(`Definición de celda incompleta para ${campo.etiqueta ?? "campo sin nombre"}.`);
+          }
           const hoja = libro.getWorksheet(campo.hoja);
+          if (!hoja) throw new Error(`No existe la hoja ${campo.hoja} en la plantilla generada.`);
 
-          if (!hoja) continue;
-
-          hoja.getCell(campo.celda_etiqueta).value =
-            campo.etiqueta;
-
-          hoja.getCell(campo.celda_valor).value =
-            estadoCampo(args.mapeo, campo.etiqueta);
-
-          const dato = args.mapeo.llenos?.find(
-            (item: any) => item.campo === campo.etiqueta
+          const etiqueta = textoCampo(campo);
+          hoja.getCell(campo.celda_etiqueta).value = etiqueta;
+          const dato = valorCampo(args.mapeo, etiqueta);
+          const confirmacion = lista(args.mapeo, "requiere_confirmacion").find(
+            (item) => item.campo === etiqueta
           );
 
-          if (dato) {
-            hoja.getCell(campo.celda_valor).value =
-              dato.valor;
+          hoja.getCell(campo.celda_valor).value =
+            dato === undefined ? estadoCampo(args.mapeo, etiqueta) : String(dato);
+
+          if (confirmacion) {
+            hoja.getCell(campo.celda_valor).note =
+              typeof confirmacion.nota === "string"
+                ? confirmacion.nota
+                : "Este dato requiere confirmación antes de su uso.";
           }
         }
 
-        const ruta = path.join(
-          salida,
-          "formulario.xlsx"
-        );
-
+        const ruta = path.join(salida, "formulario.xlsx");
         await libro.xlsx.writeFile(ruta);
-
-        return {
-          ruta,
-          formato: "xlsx",
-        };
+        return { ruta, formato: "xlsx" };
       }
 
-      // GENERACIÓN PDF
       if (solicitud.formato === "pdf") {
-        const PDFDocument =
-          (await import("pdfkit")).default;
-
-        const campos = await leerJson(
-          path.join(r.carpeta, "plantilla-campos.json")
-        );
-
-        const ruta = path.join(
-          salida,
-          "formulario.pdf"
-        );
+        const PDFDocument = (await import("pdfkit")).default;
+        const campos = await cargarPlantilla(rutas.carpeta, "pdf");
+        const ruta = path.join(salida, "formulario.pdf");
 
         await new Promise<void>((resolve, reject) => {
-          const pdf = new PDFDocument();
+          const pdf = new PDFDocument({ margin: 50 });
           const stream = createWriteStream(ruta);
-
+          pdf.on("error", reject);
+          stream.on("error", reject);
+          stream.on("finish", resolve);
           pdf.pipe(stream);
 
-          pdf
-            .fontSize(18)
-            .text("Formulario de registro de proveedor");
-
+          pdf.fontSize(18).text("Formulario de registro de proveedor");
           pdf.moveDown();
 
           for (const campo of campos) {
-            const dato = args.mapeo.llenos?.find(
-              (item: any) => item.campo === campo.etiqueta
+            const etiqueta = textoCampo(campo);
+            const dato = valorCampo(args.mapeo, etiqueta);
+            const confirmacion = lista(args.mapeo, "requiere_confirmacion").find(
+              (item) => item.campo === etiqueta
             );
-
-            const valor = dato
-              ? String(dato.valor)
-              : estadoCampo(args.mapeo, campo.etiqueta);
-
-            pdf
-              .fontSize(11)
-              .text(`${campo.etiqueta}: ${valor}`);
+            const valor = dato === undefined ? estadoCampo(args.mapeo, etiqueta) : String(dato);
+            pdf.fontSize(11).text(`${etiqueta}: ${valor}`);
+            if (confirmacion) {
+              pdf.fontSize(9).text(
+                typeof confirmacion.nota === "string"
+                  ? `ADVERTENCIA: ${confirmacion.nota}`
+                  : "ADVERTENCIA: requiere confirmación."
+              );
+            }
+            pdf.moveDown(0.4);
           }
-
           pdf.end();
-
-          stream.on("finish", resolve);
-          stream.on("error", reject);
         });
 
-        return {
-          ruta,
-          formato: "pdf",
-        };
+        return { ruta, formato: "pdf" };
       }
 
-      // GENERACIÓN DE VALORES PARA PORTAL
-      const ruta = path.join(
-        salida,
-        "valores-portal.md"
-      );
-
+      const ruta = path.join(salida, "valores-portal.md");
       const lineas = [
         "# Valores para registro en portal",
         "",
-        ...(args.mapeo.llenos ?? []).map(
-          (item: any) =>
-            `- ${item.campo}: ${item.valor}`
-        ),
+        "> El portal no se automatiza. Estos valores son una guía para diligenciamiento manual.",
         "",
-        "## Campos pendientes de clasificación",
+        "## Valores propuestos",
+        ...args.mapeo.llenos.map((item) => {
+          const confirmacion = lista(args.mapeo, "requiere_confirmacion").find(
+            (pendiente) => pendiente.campo === item.campo
+          );
+          return `- **${item.campo}:** ${String(item.valor)}${
+            confirmacion ? " — REQUIERE CONFIRMACIÓN" : ""
+          }`;
+        }),
         "",
-        ...(args.mapeo.por_validar ?? []).map(
-          (item: any) =>
-            `- ${item.campo}: POR VALIDAR OBLIGATORIEDAD`
+        "## Campos que requieren confirmación",
+        ...args.mapeo.requiere_confirmacion.map(
+          (item) => `- ${item.campo}: ${String(item.nota ?? item.motivo ?? "Pendiente de confirmación.")}`
         ),
         "",
         "## Campos obligatorios pendientes",
-        "",
-        ...(args.mapeo.faltantes ?? []).map(
-          (item: any) =>
-            `- ${item.campo}: PENDIENTE`
-        ),
+        ...args.mapeo.faltantes.map((item) => `- ${item.campo}: PENDIENTE`),
         "",
         "## Campos opcionales no informados",
-        "",
-        ...(args.mapeo.opcionales_no_informados ?? []).map(
-          (item: any) =>
-            `- ${item.campo}: NO INFORMADO (OPCIONAL)`
+        ...args.mapeo.opcionales_no_informados.map(
+          (item) => `- ${item.campo}: NO INFORMADO (OPCIONAL)`
         ),
+        "",
+        "## Campos por validar",
+        ...args.mapeo.por_validar.map((item) => `- ${item.campo}: ${item.motivo ?? "Por validar"}`),
       ];
 
-      await fs.writeFile(
-        ruta,
-        lineas.join("\n"),
-        "utf8"
-      );
-
+      await fs.writeFile(ruta, lineas.join("\n"), "utf8");
       return {
         ruta,
         formato: "portal",
+        soportado: false,
+        mensaje: "Formato portal no soportado para automatización; se generó una guía manual.",
       };
     });
   },
 };
 
 export const proveedor_armar_paquete = {
-  description: "Prepara el paquete documental y su checklist.",
+  description: "Prepara el paquete documental, checklist y borrador de correo.",
+  args: { caso: casoSchema },
 
-  args: {
-    caso: casoSchema,
-  },
-
-  async execute(
-    args: { caso: string },
-    ctx: Context
-  ): Promise<string> {
-    return ejecutar(ctx, async () => {
-      const r = await rutasCaso(ctx, args.caso);
-
-      const solicitud = await leerJson(r.solicitud);
-
-      const exigidos = await leerJson(
-        path.join(r.carpeta, "soportes-exigidos.json")
+  async execute(args: { caso: string }, ctx: Context): Promise<string> {
+    return ejecutar(async () => {
+      const rutas = await rutasCaso(ctx, args.caso);
+      const solicitud = await leerJson<{ de: string; cliente: string }>(rutas.solicitud);
+      const exigidos = await leerJson<string[]>(
+        path.join(rutas.carpeta, "soportes-exigidos.json")
       );
-
-      const indice = await leerJson(r.soportes);
-
-      const paquete = path.join(
-        ctx.directory,
-        "out",
-        args.caso,
-        "paquete"
-      );
-
+      const indice = await leerJson<Soporte[]>(rutas.soportes);
+      const paquete = path.join(ctx.directory, "out", args.caso, "paquete");
       await fs.mkdir(paquete, { recursive: true });
 
-      const checklist: any[] = [];
+      const checklist: ChecklistItem[] = [];
+      const hoy = new Date();
 
       for (const tipo of exigidos) {
-        const soporte = indice.find(
-          (item: any) => item.tipo === tipo
-        );
-
-        let disponible = Boolean(soporte?.archivo);
-        let vencido = Boolean(
-          soporte?.vigencia_hasta &&
-          new Date(soporte.vigencia_hasta) < new Date()
-        );
+        const soporte = indice.find((item) => item.tipo === tipo);
+        let disponible = false;
+        let vencido = false;
 
         if (soporte?.archivo) {
-          const origen = path.join(
-            r.base,
-            "repositorio",
-            "soportes",
-            soporte.archivo
-          );
-
+          const origen = path.join(rutas.base, "repositorio", "soportes", soporte.archivo);
+          const destino = path.join(paquete, path.basename(soporte.archivo));
           try {
-            await fs.copyFile(
-              origen,
-              path.join(paquete, soporte.archivo)
-            );
+            await fs.access(origen);
+            await fs.copyFile(origen, destino);
+            disponible = true;
           } catch {
             disponible = false;
           }
-        } else {
-          disponible = false;
+          vencido = fechaVencida(soporte.vigencia_hasta, hoy);
         }
 
         checklist.push({
           soporte: tipo,
           disponible,
           vencido,
+          vigencia_hasta: soporte?.vigencia_hasta ?? null,
+          descripcion: soporte?.descripcion ?? "Sin descripción en el índice documental.",
         });
       }
 
-      const listo_para_firma = checklist.every(
-        (item) => item.disponible && !item.vencido
-      );
+      const listoParaFirma = checklist.every((item) => item.disponible && !item.vencido);
+      const lineasChecklist = checklist.map((item) => {
+        const estado = !item.disponible
+          ? "FALTANTE"
+          : item.vencido
+            ? "VENCIDO"
+            : "VIGENTE";
+        const vigencia = item.vigencia_hasta ? ` (vigencia: ${item.vigencia_hasta})` : "";
+        return `- ${item.soporte}: ${estado}${vigencia} — ${item.descripcion}`;
+      });
 
       await fs.writeFile(
         path.join(paquete, "checklist.md"),
-
-        "# Checklist documental\n\n" +
-          checklist
-            .map(
-              (item) =>
-                `- ${item.soporte}: ${
-                  !item.disponible
-                    ? "NO DISPONIBLE"
-                    : item.vencido
-                    ? "VENCIDO"
-                    : "DISPONIBLE"
-                }`
-            )
-            .join("\n"),
-
+        [
+          "# Checklist documental",
+          "",
+          ...lineasChecklist,
+          "",
+          `**Estado documental:** ${listoParaFirma ? "Completo y vigente" : "No habilitado para firma"}`,
+        ].join("\n"),
         "utf8"
       );
 
+      // RN2: no incorporar datos bancarios en el borrador de correo.
       await fs.writeFile(
         path.join(paquete, "borrador-correo.md"),
-
-        `Para: ${solicitud.de}\n` +
-          `Asunto: Registro de proveedor - ${solicitud.cliente}\n\n` +
-          "Adjuntamos la documentación disponible para el proceso de registro.",
-
+        [
+          `Para: ${solicitud.de}`,
+          `Asunto: Registro de proveedor - ${solicitud.cliente}`,
+          "",
+          "Estimados,",
+          "",
+          "Adjuntamos el formulario diligenciado y los soportes documentales disponibles para continuar con el proceso de registro como proveedor.",
+          "",
+          "Quedamos atentos a sus comentarios.",
+          "",
+          "Atentamente,",
+          "Periferia IT Group",
+        ].join("\n"),
         "utf8"
       );
 
       return {
         ruta: paquete,
-        listo_para_firma,
+        listo_para_firma: listoParaFirma,
         checklist,
+        resumen: {
+          total: checklist.length,
+          disponibles: checklist.filter((item) => item.disponible).length,
+          faltantes: checklist.filter((item) => !item.disponible).length,
+          vencidos: checklist.filter((item) => item.vencido).length,
+        },
       };
     });
   },
 };
 
 export const proveedor_simular_envio = {
-  description: "Genera una constancia de simulación de envío tras confirmación explícita.",
-
+  description:
+    "Genera una constancia de envío simulado. Requiere confirmación explícita y validación independiente.",
   args: {
     caso: casoSchema,
     confirmado: z.boolean().describe("Confirmación explícita del usuario"),
@@ -634,40 +649,27 @@ export const proveedor_simular_envio = {
     args: { caso: string; confirmado: boolean },
     ctx: Context
   ): Promise<string> {
-    return ejecutar(ctx, async () => {
+    return ejecutar(async () => {
       if (args.confirmado !== true) {
-        throw new Error(
-          "Se requiere confirmación explícita para simular el envío."
-        );
+        throw new Error("Se requiere confirmación explícita para simular el envío.");
       }
 
-      // Defensa en profundidad: la herramienta vuelve a validar el caso,
-      // aunque se invoque directamente sin pasar por local-agent.ts.
       await validarElegibilidadEnvio(ctx, args.caso);
 
-      const ruta = path.join(
-        ctx.directory,
-        "out",
-        args.caso,
-        "ENVIO-SIMULADO.md"
-      );
-
-      await fs.mkdir(
-        path.dirname(ruta),
-        { recursive: true }
-      );
-
+      const ruta = path.join(ctx.directory, "out", args.caso, "ENVIO-SIMULADO.md");
+      await fs.mkdir(path.dirname(ruta), { recursive: true });
       await fs.writeFile(
         ruta,
-
-        `# Envío simulado\n\n` +
-          `Caso: ${args.caso}\n` +
-          `Fecha: ${new Date().toISOString()}\n\n` +
+        [
+          "# Envío simulado",
+          "",
+          `Caso: ${args.caso}`,
+          `Fecha: ${new Date().toISOString()}`,
+          "",
           "No se realizó ningún envío real ni firma digital.",
-
+        ].join("\n"),
         "utf8"
       );
-
       return { ruta };
     });
   },
