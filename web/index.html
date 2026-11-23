@@ -72,11 +72,32 @@
       background: #f8fafc;
       font-size: 13px;
     }
-    .tool strong { color: #174875; }
+    .tool details {
+      border: 1px solid #d7e1ed;
+      border-left: 4px solid #3477b9;
+      border-radius: 8px;
+      background: #f8fafc;
+      margin: 12px auto;
+      max-width: 95%;
+      font-size: 13px;
+    }
+    .tool summary {
+      cursor: pointer;
+      padding: 12px 14px;
+      color: #174875;
+      font-weight: bold;
+      user-select: none;
+    }
+    .tool .tool-content { padding: 0 14px 12px; }
     .tool pre {
       white-space: pre-wrap;
       overflow-wrap: anywhere;
       font-size: 12px;
+      background: #eef2f7;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 260px;
+      overflow: auto;
     }
     .thinking {
       color: #65758a;
@@ -196,29 +217,39 @@
 
   function mostrarHerramientas(herramientas) {
     for (const item of herramientas || []) {
-      const div = document.createElement("div");
-      div.className = "tool";
+      const contenedor = document.createElement("div");
+      contenedor.className = "tool";
 
-      const titulo = document.createElement("strong");
-      titulo.textContent = "Herramienta ejecutada: " + item.herramienta;
-      div.appendChild(titulo);
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Detalle técnico: " + item.herramienta;
+      details.appendChild(summary);
+
+      const contenido = document.createElement("div");
+      contenido.className = "tool-content";
 
       const argumentos = document.createElement("pre");
       argumentos.textContent = "Argumentos:\n" +
         JSON.stringify(item.argumentos, null, 2);
-      div.appendChild(argumentos);
+      contenido.appendChild(argumentos);
 
       const resultado = document.createElement("pre");
-      let contenido = item.resultado;
-
+      let resultadoFormateado = item.resultado;
       try {
-        contenido = JSON.stringify(JSON.parse(item.resultado), null, 2);
+        resultadoFormateado = JSON.stringify(
+          typeof item.resultado === "string"
+            ? JSON.parse(item.resultado)
+            : item.resultado,
+          null,
+          2
+        );
       } catch {}
+      resultado.textContent = "Resultado:\n" + resultadoFormateado;
+      contenido.appendChild(resultado);
 
-      resultado.textContent = "Resultado:\n" + contenido;
-      div.appendChild(resultado);
-
-      chat.appendChild(div);
+      details.appendChild(contenido);
+      contenedor.appendChild(details);
+      chat.appendChild(contenedor);
     }
     chat.scrollTop = chat.scrollHeight;
   }
@@ -260,10 +291,9 @@
 
       sessionId = data.sessionId;
 
-      mostrarHerramientas(data.herramientas);
-
       const respuesta = String(data.respuesta || "Sin respuesta del agente.");
       agregarMensaje(respuesta, "assistant");
+      mostrarHerramientas(data.herramientas);
 
       if (/confirmaci[oó]n|confirmar|¿deseas|¿quieres/i.test(respuesta)) {
         const aviso = document.createElement("div");

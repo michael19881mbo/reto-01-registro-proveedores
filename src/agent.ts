@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
-import { enviar } from "./llm/openai.js";
+import { ejecutarAgenteLocal } from "./local-agent.js";
 
 import {
   proveedor_leer_solicitud,
@@ -50,6 +50,21 @@ export async function ejecutarAgente(
   directory: string,
   historial: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
 ) {
+  // Selección del proveedor
+  const proveedor = (process.env.LLM_PROVIDER || "local").toLowerCase();
+
+  // Modo local: no carga ningún adaptador de IA externo
+  if (proveedor === "local") {
+    return ejecutarAgenteLocal(mensaje, sessionId, directory);
+  }
+
+  // Carga del adaptador únicamente para Gemini u OpenAI
+  if (proveedor !== "gemini" && proveedor !== "openai") {
+    throw new Error(`Proveedor LLM no soportado: ${proveedor}`);
+  }
+
+  const { enviar } = await import("./llm/openai.js");
+
   const prompt = await fs.readFile(
     path.join(process.cwd(), "agent", "prompt.md"),
     "utf8"
@@ -68,6 +83,7 @@ export async function ejecutarAgente(
   ];
 
   const logs: any[] = [];
+
   const maxIteraciones = Math.min(
     Math.max(Number(process.env.MAX_ITERATIONS || 25), 1),
     25
